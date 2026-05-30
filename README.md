@@ -6,7 +6,119 @@
 - 上传后：通过 `HEAD Object` 确认对象真实大小，更新 `used_bytes`。
 - 删除后：释放对应前缀容量。
 - 事件校准：COS `ObjectCreated` / `ObjectRemove` 事件触发云函数，异步修正用量。
-- 周期对账：按 prefix 遍历 COS 对象，修正数据库统计。
+- 周期对账：按 prefix 遍历 COS 对象 / 调用 MetaInsight 聚合查询，修正数据库统计。
+
+## 架构总览
+
+整体由「**强一致主链路**」+「**最终一致兜底**」两层组成：上传前在业务 DB 内一条 SQL 完成原子预占（硬限制），上传后通过 COS 事件 + 周期对账校真实用量（软校准）。
+
+```mermaid
+flowchart LR
+    subgraph Client["业务客户端 / SDK"]
+        C1[团队 A 上传脚本]
+        C2[团队 B 训练任务]
+    end
+
+    subgraph Service["Quota Service (FastAPI)"]
+        API[REST API<br/>/quotas /uploads /events /objects]
+        SVC[QuotaService<br/>原子预占 + 真实大小校准]
+        COSC[COS Client<br/>HEAD / DELETE / LIST]
+        STSC[STS Provider<br/>prefix 级临时密钥缓存]
+        MIC[MetaInsight Client<br/>聚合查询存量]
+    end
+
+    subgraph DB["业务 DB (SQLite/MySQL)"]
+        T1[(PrefixQuota<br/>quota / used / reserved)]
+        T2[(UploadSession<br/>PENDING/COMPLETED/EXPIRED)]
+        T3[(ObjectRecord<br/>对象 → size 索引)]
+    end
+
+    subgraph Tencent["腾讯云"]
+        COS[(COS Bucket<br/>examplebucket-xxx)]
+        STS[STS 临时密钥服务]
+        MI[MetaInsight 数据集]
+        SCF[SCF 云函数<br/>事件回调 / 定时器]
+    end
+
+    Cron[Cron / 定时器<br/>cron.py]
+
+    C1 -- 1.申请上传 --> API
+    C2 -- 1.申请上传 --> API
+    API --> SVC
+    SVC -- 2.原子 UPDATE 校验+预占 --> T1
+    SVC -- 3.创建会话 --> T2
+    SVC -- 4.申请 prefix 级 token --> STSC --> STS
+    SVC -- 5.返回 presigned URL / STS --> Client
+    Client -- 6.直传 --> COS
+    Client -- 7.complete --> API
+    SVC -- 8.HEAD 校真实大小 --> COSC --> COS
+    SVC -- 9.used += delta, reserved -= --> T1
+    SVC -- 10.写对象记录 --> T3
+
+    COS -. 异步事件 .-> SCF -. handle_cos_event .-> SVC
+    Cron -. expire / reconcile .-> SVC
+    SVC -- 全量对账 --> COSC
+    SVC -- 秒级聚合 --> MIC --> MI
+
+    classDef storage fill:#fff4e6,stroke:#e8a838,color:#333
+    classDef cloud fill:#e6f4ff,stroke:#1677ff,color:#333
+    classDef svc fill:#f5f5f5,stroke:#666,color:#333
+    class T1,T2,T3 storage
+    class COS,STS,MI,SCF cloud
+    class API,SVC,COSC,STSC,MIC svc
+```
+
+> **关键约束**：硬限制只能由 `/uploads/apply` 在 DB 内完成（上传前），COS 事件通知和对账只能做事后校准，不能阻止控制台直传或越权写入——这是腾讯云 COS 原生不支持前缀级 Quota 决定的设计边界。
+
+## 关键流程时序图
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant Client as 业务客户端
+    participant API as Quota Service
+    participant DB as 业务 DB
+    participant COS as 腾讯云 COS
+    participant STS as 腾讯云 STS
+    participant SCF as SCF 事件
+    participant Cron as Cron / 定时器
+
+    rect rgb(235,245,255)
+    Note over Client,COS: 主链路：硬限制 + 真实大小校真
+    Client->>API: POST /uploads/apply<br/>(bucket, prefix, key, file_size)
+    API->>DB: 原子 UPDATE：used+reserved+delta ≤ quota?
+    alt 超限
+        DB-->>API: rowcount = 0
+        API-->>Client: 409 quota exceeded
+    else 通过
+        DB-->>API: reserved_bytes += delta
+        API->>STS: 申请 prefix 级临时密钥（可选）
+        API->>COS: 生成单对象 Presigned PUT URL
+        API-->>Client: upload_id + URL + credential
+        Client->>COS: PUT object
+        Client->>API: POST /uploads/{id}/complete
+        API->>COS: HEAD Object → 真实 size / etag
+        API->>DB: used += actual_delta<br/>reserved -= reserved_delta
+        API-->>Client: 200 COMPLETED
+    end
+    end
+
+    rect rgb(245,235,255)
+    Note over COS,DB: 异步治理：事件通知兜底
+    COS-->>SCF: ObjectCreated / ObjectRemove
+    SCF->>API: handle_cos_event(event)
+    API->>DB: 校准 used_bytes / object_record
+    end
+
+    rect rgb(235,255,235)
+    Note over Cron,DB: 定时任务：过期清理 + 对账
+    Cron->>API: POST /uploads/expire
+    API->>DB: PENDING 且过期 → EXPIRED<br/>归还 reserved_bytes
+    Cron->>API: reconcile_handler
+    API->>COS: MetaInsight 聚合 / ListObjects
+    API->>DB: used_bytes = 真实值, reserved = 0
+    end
+```
 
 ## 目录结构
 
@@ -21,8 +133,10 @@ cos-prefix-quota-service/
     schemas.py           # Pydantic 模型
     config.py            # 环境变量配置
     database.py          # 数据库连接
-  scf_cos_event_handler.py
-  reconcile.py
+    metainsight_client.py # MetaInsight 聚合查询封装
+  scf_cos_event_handler.py # SCF 事件入口
+  reconcile.py             # 单次对账 CLI
+  cron.py                  # 过期清理 + 全量对账（cron / SCF 定时器入口）
   requirements.txt
   .env.example
 ```
